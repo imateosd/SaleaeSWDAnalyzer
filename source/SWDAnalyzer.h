@@ -21,7 +21,11 @@ public:
 	virtual const char* GetAnalyzerName() const;
 	virtual bool NeedsRerun();
 
+protected: //functions
+	void AddSequenceFrame( U8 type, U64 start_sample, U64 end_sample, U64 data1, U64 data2 = 0 );
+
 protected: //vars
+	U64 mLastFrameEnd;
 	std::auto_ptr< SWDAnalyzerSettings > mSettings;
 	std::auto_ptr< SWDAnalyzerResults > mResults;
 	AnalyzerChannelData* mSWDIO;

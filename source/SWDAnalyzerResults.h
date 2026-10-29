@@ -6,6 +6,18 @@
 class SWDAnalyzer;
 class SWDAnalyzerSettings;
 
+/* Frame::mType values */
+enum SWDFrameType
+{
+	SWD_FRAME_TRANSACTION = 0,
+	SWD_FRAME_LINE_RESET,      /* mData1 = number of SWDIO high cycles, mData2 = idle cycles after them */
+	SWD_FRAME_JTAG_TO_SWD,
+	SWD_FRAME_SWD_TO_DORMANT,
+	SWD_FRAME_JTAG_TO_DORMANT,
+	SWD_FRAME_SELECTION_ALERT,
+	SWD_FRAME_ACTIVATION,      /* mData1 = 12 bits following the alert: 4 low cycles + 8-bit code */
+};
+
 class SWDAnalyzerResults : public AnalyzerResults
 {
 public:

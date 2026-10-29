@@ -73,6 +73,40 @@ static void build_string ( char *number_str, Frame *frame )
 	unsigned op_code, reg_addr, ack_code;
 	const char *op_name, *reg_name;
 
+	switch (frame->mType)
+	{
+	case SWD_FRAME_LINE_RESET:
+		/* mData2 = idle cycles after the high run: required by ADIv6 (>= 2), optional in ADIv5 */
+		if (frame->mData2)
+			sprintf(number_str, "Line reset (%u high + %u idle)", (unsigned)frame->mData1, (unsigned)frame->mData2);
+		else
+			sprintf(number_str, "Line reset (%u high)", (unsigned)frame->mData1);
+		return;
+	case SWD_FRAME_JTAG_TO_SWD:
+		sprintf(number_str, "JTAG-to-SWD 0x%04X", (unsigned)frame->mData1);
+		return;
+	case SWD_FRAME_SWD_TO_DORMANT:
+		sprintf(number_str, "SWD-to-Dormant 0x%04X", (unsigned)frame->mData1);
+		return;
+	case SWD_FRAME_JTAG_TO_DORMANT:
+		sprintf(number_str, "JTAG-to-Dormant 0x%08X", (unsigned)frame->mData1);
+		return;
+	case SWD_FRAME_SELECTION_ALERT:
+		sprintf(number_str, "Selection alert");
+		return;
+	case SWD_FRAME_ACTIVATION:
+		/* mData1: bits [3:0] are the 4 low cycles, bits [11:4] the activation code */
+		if (0x1A0 == frame->mData1)
+			sprintf(number_str, "Activation code 0x1A (SW-DP)");
+		else if (0 == (frame->mData1 & 0xF))
+			sprintf(number_str, "Activation code 0x%02X (not SW-DP)", (unsigned)(frame->mData1 >> 4));
+		else
+			sprintf(number_str, "Activation code: bad lead-in, bits 0x%03X", (unsigned)frame->mData1);
+		return;
+	default:
+		break;
+	}
+
 	op_code  = (frame->mData1 & 0x0C) >> 2;
 	reg_addr = (frame->mData1 & 0x03);
 	ack_code = (frame->mData1 & 0x70) >> 4;

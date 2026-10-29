@@ -50,6 +50,37 @@ void SWDAnalyzer::SetupResults()
 	mResults->AddChannelBubblesWillAppearOn( mSettings->mSWDIOChannel );
 }
 
+/* frames must not overlap, so clip a sequence frame to start after the last frame added */
+void SWDAnalyzer::AddSequenceFrame( U8 type, U64 start_sample, U64 end_sample, U64 data1, U64 data2 )
+{
+	if ( start_sample <= mLastFrameEnd )
+		start_sample = mLastFrameEnd + 1;
+	if ( start_sample > end_sample )
+		return;
+
+	Frame frame;
+	frame.mType = type;
+	frame.mData1 = data1;
+	frame.mData2 = data2;
+	frame.mFlags = 0;
+	frame.mStartingSampleInclusive = start_sample;
+	frame.mEndingSampleInclusive = end_sample;
+	mResults->AddFrame( frame );
+	mLastFrameEnd = end_sample;
+}
+
+/*
+    ADIv5.2/ADIv6 B5.3 sequences; all are sent LSB first, so after shifting each new bit
+    in at the top of the 128-bit history (hist_hi:hist_lo), the last n bits received equal
+    (hist_hi >> (64 - n)).
+*/
+#define SELECTION_ALERT_HI  0x19BC0EA2E3DDAFE9ull
+#define SELECTION_ALERT_LO  0x86852D956209F392ull
+#define JTAG_TO_SWD         0xE79E      /* 16 bits, after a line reset */
+#define SWD_TO_DORMANT      0xE3BC      /* 16 bits, after a line reset */
+#define JTAG_TO_DORMANT     0x33BBBBBA  /* 31 bits, after >= 5 cycles high */
+#define ACTIVATION_BITS     12          /* 4 cycles low + 8-bit activation code */
+
 void SWDAnalyzer::WorkerThread()
 {
 	mSWDIO = GetAnalyzerChannelData( mSettings->mSWDIOChannel );
@@ -88,9 +119,25 @@ void SWDAnalyzer::WorkerThread()
 	U8 command, ack;
 	U32 data;
 
+	U64 hist_hi = 0, hist_lo = 0;   /* last 128 SWDIO bits, newest in bit 63 of hist_hi */
+	U64 edge_samples[128];          /* sample number of each of the last 128 bits */
+	U64 bit_number = 0;
+	U64 ones_start_sample = 0;
+	U32 bits_since_alert = 0xFFFFFFFF;
+
+	/*
+	    A line reset is >= 50 cycles high; ADIv6 also requires >= 2 idle cycles after it, ADIv5 doesn't.
+	    The low bits after the high run are only idle cycles if they don't start a JTAG-to-SWD,
+	    SWD-to-Dormant or JTAG-to-Dormant sequence, so the frame is held back until that's ruled out.
+	*/
+	bool reset_pending = false, reset_counting_idle = false;
+	U64 reset_start = 0, reset_high_end = 0, reset_idle_end = 0;
+	U32 reset_ones = 0, reset_idle = 0, bits_since_reset = 0;
+
 	state = RST;
 	ones_count = 6;
 	previous_current_sample = 0;
+	mLastFrameEnd = 0;
 
 	for( ; ; )
 	{
@@ -218,12 +265,14 @@ void SWDAnalyzer::WorkerThread()
 				next_state = (command & 0x4) ? ENDTRN : START;
 				mResults->AddMarker( current_sample, (parity == rise_bit) ? AnalyzerResults::Dot : AnalyzerResults::ErrorDot, mSettings->mSWDIOChannel );
 
+				frame.mType = SWD_FRAME_TRANSACTION;
 				frame.mData1 = (U32)command + ( (U32)ack << 4 );
 				frame.mData2 = data;
 				frame.mFlags = 0;
 				frame.mStartingSampleInclusive = onset_sample;
 				frame.mEndingSampleInclusive = current_sample;
 				mResults->AddFrame( frame );
+				mLastFrameEnd = current_sample;
 			}
 			else
 			{
@@ -245,11 +294,90 @@ void SWDAnalyzer::WorkerThread()
 				mResults->AddMarker( current_sample, AnalyzerResults::UpArrow, mSettings->mSWDIOChannel);
 			break;
 		default:
-			break; 		
+			break;
+		}
+
+		/* out-of-band sequences, recognised regardless of the transaction state machine */
+		hist_lo = (hist_lo >> 1) | (hist_hi << 63);
+		hist_hi = (hist_hi >> 1) | ( (U64)rise_bit << 63 );
+		edge_samples[bit_number & 127] = current_sample;
+		bit_number++;
+
+		if ( !rise_bit && (ones_count >= 50) )
+		{
+			reset_pending = true;
+			reset_counting_idle = true;
+			reset_start = ones_start_sample;
+			reset_high_end = previous_current_sample;
+			reset_ones = ones_count;
+			reset_idle = 0;
+			bits_since_reset = 0;
+		}
+		if ( reset_pending )
+		{
+			bits_since_reset++;
+			if ( reset_counting_idle && !rise_bit )
+			{
+				reset_idle++;
+				reset_idle_end = current_sample;
+			}
+			else
+				reset_counting_idle = false;
+
+			U32 seq = (U32)(hist_hi >> 48);
+			if ( (16 == bits_since_reset) && ( (JTAG_TO_SWD == seq) || (SWD_TO_DORMANT == seq) ) )
+			{
+				AddSequenceFrame( SWD_FRAME_LINE_RESET, reset_start, reset_high_end, reset_ones );
+				AddSequenceFrame( (JTAG_TO_SWD == seq) ? SWD_FRAME_JTAG_TO_SWD : SWD_FRAME_SWD_TO_DORMANT,
+					edge_samples[(bit_number - 16) & 127], current_sample, seq );
+				reset_pending = false;
+				next_state = RST; /* both must be followed by a line reset or a selection alert */
+			}
+			else if ( (31 == bits_since_reset) &&
+				( ( (U32)(hist_hi >> 33) == JTAG_TO_DORMANT ) || ( (hist_hi >> 33) == (SELECTION_ALERT_LO & 0x7FFFFFFF) ) ) )
+			{
+				/* JTAG-to-Dormant, or the start of a selection alert: their frames are added below */
+				AddSequenceFrame( SWD_FRAME_LINE_RESET, reset_start, reset_high_end, reset_ones );
+				reset_pending = false;
+			}
+			else if ( (bits_since_reset >= 31) && !reset_counting_idle )
+			{
+				AddSequenceFrame( SWD_FRAME_LINE_RESET, reset_start, reset_idle ? reset_idle_end : reset_high_end,
+					reset_ones, reset_idle );
+				reset_pending = false;
+			}
+		}
+		if ( ( (U32)(hist_hi >> 33) == JTAG_TO_DORMANT ) && ( ( (hist_hi >> 28) & 0x1F ) == 0x1F ) )
+		{
+			AddSequenceFrame( SWD_FRAME_JTAG_TO_DORMANT, edge_samples[(bit_number - 31) & 127], current_sample, JTAG_TO_DORMANT );
+			next_state = RST;
+		}
+		if ( (SELECTION_ALERT_HI == hist_hi) && (SELECTION_ALERT_LO == hist_lo) && (bit_number >= 128) )
+		{
+			AddSequenceFrame( SWD_FRAME_SELECTION_ALERT, edge_samples[bit_number & 127], current_sample, 0 );
+			bits_since_alert = 0;
+			next_state = RST;
+		}
+		else if ( bits_since_alert != 0xFFFFFFFF )
+		{
+			if ( ACTIVATION_BITS == ++bits_since_alert )
+			{
+				AddSequenceFrame( SWD_FRAME_ACTIVATION, edge_samples[(bit_number - ACTIVATION_BITS) & 127], current_sample,
+					(U32)(hist_hi >> (64 - ACTIVATION_BITS)) );
+				bits_since_alert = 0xFFFFFFFF;
+				next_state = RST;
+			}
 		}
 
 		if ( rise_bit )
+		{
+			if ( (0 == ones_count) || (1 == bit_number) )
+				ones_start_sample = current_sample;
 			ones_count++;
+			/* 50 consecutive highs can't occur inside a valid transaction: abandon it */
+			if ( ones_count >= 50 )
+				next_state = RST;
+		}
 		else
 			ones_count = 0;
 
