@@ -104,7 +104,8 @@ void SWDAnalyzer::WorkerThread()
 
 #if 1
 		/* method of jump-starting decoding if capture doesn't include 50 ones */
-		if ( (current_sample - previous_current_sample) > 10000 )
+		/* only while lost: hosts may legally stall SWCLK mid-transaction (e.g. at turnaround) */
+		if ( (RST == state) && (current_sample - previous_current_sample) > 10000 )
 			state = START;
 #endif
 
